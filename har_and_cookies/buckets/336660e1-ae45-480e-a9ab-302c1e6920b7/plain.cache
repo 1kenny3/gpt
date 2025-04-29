@@ -1,0 +1,185 @@
+```bot.py
+import asyncio
+import logging
+from aiogram import Bot, Dispatcher, types
+from aiogram.filters.command import Command
+from aiogram.types import Message, InlineKeyboardMarkup, InlineKeyboardButton, CallbackQuery
+from config import BOT_TOKEN
+from g4f.client import Client
+import os
+from dataclasses import dataclass
+from typing import Dict
+
+# Настройка логирования
+logging.basicConfig(level=logging.INFO)
+
+# Инициализация бота и диспетчера
+bot = Bot(token=BOT_TOKEN)
+dp = Dispatcher()
+
+# Инициализация клиента g4f
+client = Client()
+
+# Словарь для хранения промптов пользователей
+user_prompts: Dict[int, str] = {}
+
+# Доступные модели ARTA
+@dataclass
+class ArtaModel:
+    id: str
+    name: str
+    description: str
+
+ARTA_MODELS = [
+    ArtaModel("cinematic_art", "Cinematic Art", "Кинематографический стиль"),
+    ArtaModel("anime", "Anime", "Аниме стиль"),
+    ArtaModel("realistic", "Realistic", "Реалистичный стиль"),
+    ArtaModel("creative", "Creative", "Креативный стиль"),
+    ArtaModel("manga", "Manga", "Манга стиль"),
+    ArtaModel("disney", "Disney", "Стиль Диснея"),
+    ArtaModel("enhance", "Enhance", "Улучшенное качество"),
+    ArtaModel("pixel_art", "Pixel Art", "Пиксельная графика")
+]
+
+# Словарь для быстрого доступа к моделям по ID
+MODELS_DICT = {model.id: model for model in ARTA_MODELS}
+
+def get_models_keyboard() -> InlineKeyboardMarkup:
+    """Создает клавиатуру с кнопками выбора модели"""
+    keyboard = InlineKeyboardMarkup(row_width=2)
+    for model in ARTA_MODELS:
+        keyboard.add(InlineKeyboardButton(
+            text=f"{model.name} - {model.description}",
+            callback_data=f"model_{model.id}"
+        ))
+    return keyboard
+
+@dp.message(Command("start"))
+async def cmd_start(message: Message):
+    await message.answer(
+        "Привет! Я бот для генерации изображений.\n"
+        "Используй команду /generate с описанием желаемого изображения.\n"
+        "Примеры использования:\n"
+        "1. /generate красивый закат над морем - выбор модели через кнопки\n"
+        "2. /generate anime красивый закат над морем - прямое указание модели\n\n"
+        "Для просмотра списка доступных моделей используйте /models"
+    )
+
+@dp.message(Command("generate"))
+async def generate_prompt(message: Message):
+    # Получаем текст после команды
+    text = message.text.replace("/generate", "").strip()
+    
+    if not text:
+        await message.answer(
+            "Пожалуйста, добавьте описание изображения после команды /generate\n"
+            "Примеры:\n"
+            "1. /generate красивый закат над морем\n"
+            "2. /generate anime красивый закат над морем"
+        )
+        return
+    
+    # Проверяем, начинается ли текст с названия модели
+    first_word = text.split()[0].lower()
+    
+    # Ищем модель по ID или имени
+    selected_model = None
+    prompt = text
+    
+    for model in ARTA_MODELS:
+        if first_word in [model.id.lower(), model.name.lower()]:
+            selected_model = model
+            # Убираем название модели из промпта
+            prompt = " ".join(text.split()[1:])
+            break
+    
+    if selected_model:
+        # Если модель указана явно, генерируем изображение
+        await generate_image(message, selected_model.id, prompt)
+    else:
+        # Если модель не указана, сохраняем промпт и показываем выбор модели
+        user_prompts[message.from_user.id] = text
+        await message.answer(
+            "Выберите стиль генерации изображения:",
+            reply_markup=get_models_keyboard()
+        )
+
+async def generate_image(message: Message, model_id: str, prompt: str):
+    """Генерирует изображение с указанной моделью и промптом"""
+    try:
+        # Отправляем сообщение о начале генерации
+        processing_msg = await message.answer("🎨 Генерирую изображение, пожалуйста подождите...")
+        
+        # Генерируем изображение
+        response = await asyncio.to_thread(
+            client.images.generate,
+            model=model_id,
+            prompt=prompt,
+            response_format="url"
+        )
+        
+        # Получаем URL сгенерированного изображения
+        image_url = response.data[0].url
+        
+        # Находим название модели
+        model = MODELS_DICT.get(model_id)
+        model_name = model.name if model else model_id
+        
+        # Отправляем изображение
+        await message.answer_photo(
+            photo=image_url,
+            caption=f"🎨 Сгенерировано в стиле {model_name}\nЗапрос: {prompt}"
+        )
+        
+        # Удаляем сообщение о генерации
+        await processing_msg.delete()
+        
+    except Exception as e:
+        logging.error(f"Ошибка при генерации изображения: {e}")
+        await message.answer(
+            "Произошла ошибка при генерации изображения. Пожалуйста, попробуйте позже."
+        )
+
+@dp.callback_query(lambda c: c.data.startswith('model_'))
+async def process_model_selection(callback_query: CallbackQuery):
+    # Получаем ID модели из callback_data
+    model_id = callback_query.data.replace('model_', '')
+    
+    # Получаем сохраненный промпт пользователя
+    prompt = user_prompts.get(callback_query.from_user.id)
+    
+    if not prompt:
+        await callback_query.message.answer("Произошла ошибка. Пожалуйста, попробуйте снова с командой /generate")
+        await callback_query.answer()
+        return
+    
+    # Удаляем сообщение с кнопками выбора модели
+    await callback_query.message.delete()
+    
+    # Генерируем изображение
+    await generate_image(callback_query.message, model_id, prompt)
+    
+    # Удаляем промпт пользователя из словаря
+    del user_prompts[callback_query.from_user.id]
+    
+    await callback_query.answer()
+
+@dp.message(Command("models"))
+async def show_models(message: Message):
+    """Показывает список доступных моделей"""
+    models_text = "Доступные модели:\n\n"
+    for model in ARTA_MODELS:
+        models_text += f"• {model.name} ({model.id}) - {model.description}\n"
+    
+    models_text += "\nВы можете использовать название модели прямо в команде generate:\n"
+    models_text += "Например: /generate anime красивый закат над морем"
+    
+    await message.answer(models_text)
+
+async def main():
+    await dp.start_polling(bot)
+
+if __name__ == "__main__":
+    asyncio.run(main()) 
+```
+

@@ -1,19 +1,69 @@
-import asyncio
+# Стандартные библиотеки
+import os
+import re
+import sys
 import logging
+import asyncio
+import tempfile
+import subprocess
+import shutil
+from os import path
+
+# Сторонние библиотеки
+import aiohttp
+import youtube_dl
+from pytube import YouTube
+from pytube.exceptions import PytubeError
+from dotenv import load_dotenv
 from aiogram import Bot, Dispatcher, types
+from aiogram.types import (
+    Message, 
+    InlineKeyboardMarkup, 
+    InlineKeyboardButton,
+    CallbackQuery
+)
+from aiogram.enums import ChatAction
 from aiogram.filters.command import Command
-from aiogram.types import Message, InlineKeyboardMarkup, InlineKeyboardButton, CallbackQuery
 from config import BOT_TOKEN
 from g4f.client import Client
 from dataclasses import dataclass
 from typing import Dict
+import yt_dlp
+
+# Регулярное выражение для проверки YouTube ссылок
+YOUTUBE_URL_PATTERN = r'(https?://)?(www\.)?(youtube\.com/watch\?v=|youtu\.be/)[A-Za-z0-9_-]+'
+
+# Константы для OpenRouter API
+OPENROUTER_API_URL = "https://openrouter.ai/api/v1/chat/completions"
+MODEL_NAME = "anthropic/claude-3-sonnet"
+
+# Регулярное выражение для проверки YouTube URL
+YOUTUBE_REGEX = r'(?:https?:\/\/)?(?:www\.)?(?:youtube\.com\/(?:watch\?v=|embed\/|v\/)|youtu\.be\/)([a-zA-Z0-9_-]+)'
+
+# Проверка наличия ffmpeg
+HAS_FFMPEG = bool(shutil.which('ffmpeg'))
+if not HAS_FFMPEG:
+    logging.warning("ffmpeg не установлен! Функционал скачивания MP3 будет недоступен.")
+
+# Загрузка переменных окружения
+load_dotenv()
+
+# Получение токенов из переменных окружения
+API_KEY = os.getenv('OPENROUTER_API_KEY')
+BOT_TOKEN = os.getenv('BOT_TOKEN')
+
+if not API_KEY:
+    raise ValueError("OPENROUTER_API_KEY не найден в переменных окружения!")
+
+if not BOT_TOKEN:
+    raise ValueError("BOT_TOKEN не найден в переменных окружения!")
+
+# Настройка бота
+bot = Bot(token=BOT_TOKEN)
+dp = Dispatcher()
 
 # Настройка логирования
 logging.basicConfig(level=logging.INFO)
-
-# Инициализация бота и диспетчера
-bot = Bot(token=BOT_TOKEN)
-dp = Dispatcher()
 
 # Инициализация клиента g4f
 client = Client()
@@ -59,7 +109,7 @@ ARTA_MODELS = [
     ArtaModel("realistic_tattoo", "Realistic Tattoo", "Реалистичное тату", "📸"),
     ArtaModel("japanese_2", "Japanese", "Японский стиль", "📸"),
     ArtaModel("realistic_stock_xl", "Stock XL", "Реалистичный сток", "📸"),
-    ArtaModel("f_pro", "F-Pro", "F-Pro Generation", "📸"),
+    ArtaModel("f_pro", "F-Pro", "F-Pro Generation", "��"),
     ArtaModel("reanimated", "Reanimated", "Reanimated Generation", "📸"),
     ArtaModel("katayama_mix_xl", "Katayama Mix", "Katayama Mix XL", "📸"),
     ArtaModel("sdxl_l", "SDXL-L", "SDXL-L Generation", "📸"),
@@ -154,7 +204,7 @@ def get_models_list_keyboard() -> InlineKeyboardMarkup:
 @dp.message(Command("start"))
 async def cmd_start(message: Message):
     await message.answer(
-        "🎨 Привет! Я бот для генерации изображений.\n"
+        "Привет, Тотоньйо. Че хочешь ?\n"
         "Используй команду /generate с описанием желаемого изображения.\n\n"
         "Примеры команд:\n"
         "• /generate закат над городом\n"
@@ -293,7 +343,258 @@ async def model_info_callback(callback_query: CallbackQuery):
         reply_markup=get_models_list_keyboard()
     )
 
+async def get_openrouter_response(prompt: str) -> dict:
+    """
+    Получает ответ от OpenRouter API
+    
+    Args:
+        prompt (str): Текст запроса пользователя
+        
+    Returns:
+        dict: Ответ от API или строка с сообщением об ошибке
+    """
+    headers = {
+        "Authorization": f"Bearer {API_KEY}",
+        "HTTP-Referer": "https://github.com/xtekky/gpt4free",
+        "X-Title": "gpt4free",
+        "Content-Type": "application/json"
+    }
+    
+    data = {
+        "model": MODEL_NAME,
+        "messages": [{"role": "user", "content": prompt}],
+        "temperature": 0.7,
+        "max_tokens": 2000  # Ограничиваем количество токенов
+    }
+    
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.post(OPENROUTER_API_URL, headers=headers, json=data) as response:
+                response_json = await response.json()
+                logging.info(f"OpenRouter API response: {response_json}")
+                
+                if response.status == 200:
+                    return response_json
+                elif response.status == 402:
+                    error_msg = response_json.get('error', {}).get('message', 'Недостаточно кредитов')
+                    logging.error(f"OpenRouter API credit error: {error_msg}")
+                    return "⚠️ Извините, у бота закончились кредиты. Пожалуйста, сообщите администратору."
+                else:
+                    error_msg = response_json.get('error', {}).get('message', 'Неизвестная ошибка')
+                    logging.error(f"OpenRouter API error: Status {response.status}, Message: {error_msg}")
+                    return f"Ошибка при получении ответа от API: {error_msg}"
+    except Exception as e:
+        logging.error(f"Error calling OpenRouter API: {str(e)}")
+        return f"Произошла ошибка при обращении к API: {str(e)}"
+
+@dp.message(lambda message: re.match(YOUTUBE_REGEX, message.text))
+async def youtube_link_handler(message: types.Message):
+    """Обрабатывает сообщения содержащие YouTube ссылки"""
+    url = message.text
+    await process_youtube_url(message, url)
+
+@dp.message(Command(commands=['start', 'help']))
+async def send_welcome(message: types.Message):
+    """
+    Обработчик команд /start и /help
+    """
+    welcome_text = (
+        "Привет, Тотоньйо. Че хочешь ?\n\n"
+        "1️⃣ Отвечать на ваши вопросы с помощью AI\n"
+        "2️⃣ Генерировать изображения\n"
+        "3️⃣ Скачивать аудио с YouTube\n\n"
+        "Команды:\n"
+        "/help - показать это сообщение\n"
+        "/generate - генерировать изображение\n"
+        "/mp3 [youtube_url] - скачать аудио с YouTube\n\n"
+        "Просто отправьте мне сообщение для общения с AI или ссылку на YouTube видео! 🚀"
+    )
+    await message.reply(welcome_text)
+
+@dp.message(Command('mp3'))
+async def download_audio(message: types.Message):
+    """
+    Обработчик команды /mp3 для скачивания аудио с YouTube
+    """
+    try:
+        # Получаем URL из сообщения
+        command_parts = message.text.split()
+        if len(command_parts) != 2:
+            await message.reply("❌ Пожалуйста, укажите URL YouTube видео после команды /mp3")
+            return
+        
+        url = command_parts[1]
+        if not re.match(YOUTUBE_REGEX, url):
+            await message.reply("❌ Пожалуйста, укажите корректную ссылку на YouTube видео")
+            return
+        
+        # Отправляем сообщение о начале загрузки
+        status_message = await message.reply("⏳ Начинаю загрузку аудио...")
+        
+        # Создаем временную директорию для загрузки
+        with tempfile.TemporaryDirectory() as temp_dir:
+            try:
+                # Загружаем видео
+                yt = YouTube(url)
+                audio_stream = yt.streams.filter(only_audio=True).first()
+                
+                if not audio_stream:
+                    await status_message.edit_text("❌ Не удалось найти аудио поток в этом видео")
+                    return
+                
+                # Загружаем аудио
+                audio_file = audio_stream.download(output_path=temp_dir)
+                
+                # Конвертируем в MP3
+                base, _ = os.path.splitext(audio_file)
+                mp3_file = base + '.mp3'
+                
+                # Проверяем наличие ffmpeg
+                if not HAS_FFMPEG:
+                    await status_message.edit_text("❌ Для конвертации аудио требуется ffmpeg")
+                    return
+                
+                # Конвертируем в MP3
+                subprocess.run(['ffmpeg', '-i', audio_file, '-codec:a', 'libmp3lame', '-qscale:a', '2', mp3_file])
+                
+                # Отправляем файл
+                with open(mp3_file, 'rb') as audio:
+                    await message.reply_audio(
+                        audio,
+                        title=yt.title,
+                        performer=yt.author,
+                        caption=f"🎵 {yt.title}\n👤 {yt.author}"
+                    )
+                
+                await status_message.delete()
+                
+            except Exception as e:
+                logging.error(f"Ошибка при загрузке аудио: {str(e)}")
+                await status_message.edit_text("❌ Произошла ошибка при загрузке аудио")
+                
+    except Exception as e:
+        logging.error(f"Ошибка в обработчике /mp3: {str(e)}")
+        await message.reply("❌ Произошла ошибка при обработке команды")
+
+@dp.message()
+async def handle_message(message: types.Message):
+    """
+    Обработчик текстовых сообщений для общения с OpenRouter API
+    """
+    try:
+        # Проверяем, является ли сообщение YouTube ссылкой
+        if re.match(YOUTUBE_REGEX, message.text):
+            await process_youtube_url(message, message.text)
+            return
+
+        # Отправляем индикатор набора текста
+        await bot.send_chat_action(chat_id=message.chat.id, action=ChatAction.TYPING)
+        
+        # Получаем ответ от OpenRouter API
+        response = await get_openrouter_response(message.text)
+        
+        if isinstance(response, str):  # Если получили строку с ошибкой
+            await message.reply(response)
+            return
+            
+        # Извлекаем текст ответа из response
+        try:
+            if 'choices' in response and len(response['choices']) > 0:
+                answer = response['choices'][0]['message']['content']
+                await message.reply(answer)
+            elif 'error' in response:
+                error_msg = response['error'].get('message', 'Неизвестная ошибка')
+                logging.error(f"API error response: {error_msg}")
+                await message.reply(f"⚠️ Ошибка API: {error_msg}")
+            else:
+                logging.error(f"Unexpected API response structure: {response}")
+                await message.reply("Извините, получен некорректный ответ от API.")
+                
+        except (KeyError, IndexError) as e:
+            logging.error(f"Error extracting response content: {str(e)}, Response: {response}")
+            await message.reply("Извините, произошла ошибка при обработке ответа.")
+            
+    except Exception as e:
+        logging.error(f"Error in message handler: {str(e)}")
+        await message.reply("Извините, произошла ошибка при обработке вашего сообщения.")
+
+@dp.callback_query()
+async def process_download_callback(callback_query: types.CallbackQuery):
+    """Обрабатывает нажатие на кнопку 'Скачать MP3'"""
+    if not callback_query.data.startswith('download:'):
+        return
+        
+    await callback_query.answer()
+    
+    # Извлекаем URL из callback_data
+    youtube_url = callback_query.data.replace('download:', '')
+    
+    # Удаляем inline клавиатуру
+    await callback_query.message.edit_reply_markup(reply_markup=None)
+    
+    # Обрабатываем URL
+    await process_youtube_url(callback_query.message, youtube_url)
+
+async def download_audio(url: str) -> str:
+    """
+    Загружает аудио с YouTube видео.
+    
+    Args:
+        url (str): URL YouTube видео
+        
+    Returns:
+        str: Путь к загруженному аудио файлу
+    """
+    ydl_opts = {
+        'format': 'bestaudio/best',
+        'postprocessors': [{
+            'key': 'FFmpegExtractAudio',
+            'preferredcodec': 'mp3',
+            'preferredquality': '192',
+        }],
+        'outtmpl': '%(title)s.%(ext)s',
+    }
+    
+    try:
+        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+            info = ydl.extract_info(url, download=True)
+            return f"{info['title']}.mp3"
+    except Exception as e:
+        logging.error(f"Ошибка при загрузке аудио: {str(e)}")
+        raise
+
+async def process_youtube_url(message: types.Message, url: str):
+    """
+    Обрабатывает YouTube ссылку: загружает аудио и отправляет его пользователю.
+    
+    Args:
+        message (types.Message): Сообщение от пользователя
+        url (str): YouTube URL для обработки
+    """
+    try:
+        # Отправляем сообщение о начале загрузки
+        status_message = await message.reply("⏳ Загружаю аудио...")
+        
+        # Загружаем аудио
+        audio_path = await download_audio(url)
+        
+        # Отправляем аудио файл
+        with open(audio_path, 'rb') as audio:
+            await message.reply_audio(audio)
+            
+        # Удаляем статусное сообщение и временные файлы
+        await status_message.delete()
+        os.remove(audio_path)
+        
+    except Exception as e:
+        error_message = f"❌ Произошла ошибка при обработке видео: {str(e)}"
+        if 'status_message' in locals():
+            await status_message.edit_text(error_message)
+        else:
+            await message.reply(error_message)
+
 async def main():
+    # Запускаем бота
     await dp.start_polling(bot)
 
 if __name__ == "__main__":
